@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 bevy = {version="0.11", features=["dynamic_linking"]}
+bevy-inspector-egui = "0.19"
+bevy_iced = "0.4"
 
 # Enable a small amount of optimization in debug mode
 [profile.dev]
@@ -17,5 +19,5 @@ opt-level = 1
 opt-level = 3
 
 # Bevy and wgpu need resolver version 2 with Cargo workspaces
-# [workspace]
-# resolver = "2"
+[workspace]
+resolver = "2"
