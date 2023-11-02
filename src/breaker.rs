@@ -1,3 +1,5 @@
+use core::f32::consts::PI;
+
 use std::time::Duration;
 
 use bevy::{
@@ -7,6 +9,7 @@ use bevy::{
         MaterialMesh2dBundle,
     },
 };
+use lerp::Lerp;
 
 use crate::{
     app_state::{AppState, AppStateTransition},
@@ -14,7 +17,7 @@ use crate::{
     health::{Health, HealthDisplay, HealthDisplayBundle},
     misc::blink::{blink, Blinking},
     scoreboard::{update_scoreboard, Scoreboard, ScoreboardBundle},
-    walls,
+    walls::{self, Wall},
 };
 
 #[derive(Resource, Deref, DerefMut, PartialEq, Eq)]
@@ -63,6 +66,17 @@ pub struct Level(usize);
 #[derive(Component)]
 pub struct Paddle;
 
+// The paddle's movement can influence where the ball goes
+#[derive(Resource, Deref, DerefMut)]
+pub struct PaddleMomentum(f32);
+
+#[derive(Resource, Deref, DerefMut)]
+pub enum ControlStyle {
+    Edges,
+    Momentum,
+    Unaltered,
+}
+
 // Likewise we're likely to have multiple balls (lol)
 #[derive(Component)]
 pub struct Ball;
@@ -86,8 +100,17 @@ struct CollisionSound(Handle<AudioSource>);
 
 const COLLISION_SOUND_PATH: &str = "sounds/breakout_collision.ogg";
 
+pub const FIXED_TIME_TICKS_PER_SECOND: f32 = 1.0 / 60.0;
+
 pub const PADDLE_DIST_FROM_BOTTOM_WALL: f32 = 60.0;
 pub const PADDLE_SIZE: Vec3 = Vec3::new(120., 20., 0.);
+pub const PADDLE_MAX_INFLUENCE: f32 = PI / 2.;
+const PADDLE_LEFT_BOUND: f32 =
+    walls::LEFT_WALL + walls::WALL_THICKNESS / 2.0 + PADDLE_SIZE.x / 2.0 + PADDLE_PADDING;
+const PADDLE_RIGHT_BOUND: f32 =
+    walls::RIGHT_WALL - walls::WALL_THICKNESS / 2.0 - PADDLE_SIZE.x / 2.0 - PADDLE_PADDING;
+const PADDLE_MAX_MOMENTUM: f32 = 7.;
+const PADDLE_LERP: f32 = 0.10;
 const PADDLE_SPEED: f32 = 500.0;
 const PADDLE_PADDING: f32 = 10.0;
 const PADDLE_STARTING_POSITION_X: f32 = 0.;
@@ -95,7 +118,8 @@ const PADDLE_STARTING_POSITION_Y: f32 = walls::BOTTOM_WALL + PADDLE_DIST_FROM_BO
 
 const BALL_STARTING_POSITION: Vec3 = Vec3::new(-150., -50., 1.);
 const BALL_SIZE: Vec3 = Vec3::new(30., 30., 0.);
-const BALL_SPEED: f32 = 400.;
+const BALL_STARTING_SPEED: f32 = 300.;
+const BALL_SPEED: f32 = 300.;
 const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
 
 const SCOREBOARD_FONT_SIZE: f32 = 40.;
@@ -111,54 +135,61 @@ const PLAYER_STARTING_HEALTH: usize = 3;
 
 const BLINK_DURATION: f64 = 1.0;
 
-// Registers everything needed for the event. Important: uses <system>.run_if to only play while GamePlaying(true)
-pub fn register_breaker(app: &mut App) {
-    app.insert_resource(Scoreboard { score: 0 })
-        .insert_resource(CurrentState(GameState::Uninitialized))
-        .insert_resource(BrickTracker(0))
-        .insert_resource(Level(1))
-        .insert_resource(Health(PLAYER_STARTING_HEALTH))
-        .add_event::<CollisionEvent>()
-        .add_event::<GameStateTransition>()
-        .add_event::<PlayerMessage>()
-        // .add_systems(Startup, (setup, walls::setup)) // TODO: Call these manually when AS::InGame && GS::Uninitialized
-        // Add frame-based updates that always run while AS::InGame
-        .add_systems(
-            Update,
-            (
-                // Run these regardless of if the game is currently playing
-                transition_game,
-                manage_game.after(transition_game),
-                game_aux_keys_handler.after(manage_game),
-                // Run these only if the game is currently playing
+pub struct BreakoutGamePlugin;
+impl Plugin for BreakoutGamePlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(Scoreboard { score: 0 })
+            .insert_resource(CurrentState(GameState::Uninitialized))
+            .insert_resource(BrickTracker(0))
+            .insert_resource(Level(1))
+            .insert_resource(Health(PLAYER_STARTING_HEALTH))
+            .insert_resource(PaddleMomentum(0.))
+            .insert_resource(ControlStyle::Edges)
+            .add_event::<CollisionEvent>()
+            .add_event::<GameStateTransition>()
+            .add_event::<PlayerMessage>()
+            // .add_systems(Startup, (setup, walls::setup)) // TODO: Call these manually when AS::InGame && GS::Uninitialized
+            // Add frame-based updates that always run while AS::InGame
+            .add_systems(
+                Update,
+                (
+                    // Run these regardless of if the game is currently playing
+                    transition_game,
+                    manage_game.after(transition_game),
+                    game_aux_keys_handler.after(manage_game),
+                    // Run these only if the game is currently playing
+                )
+                    .run_if(state_exists_and_equals(AppState::InGame)),
             )
-                .run_if(state_exists_and_equals(AppState::InGame)),
-        )
-        // Add frame-based updates that only run while GS::Playing
-        .add_systems(
-            Update,
-            (
-                health_handler,
-                update_scoreboard,
-                blink,
-                play_collision_sound,
+            // Add frame-based updates that only run while GS::Playing
+            .add_systems(
+                Update,
+                (
+                    health_handler,
+                    update_scoreboard,
+                    blink,
+                    play_collision_sound,
+                )
+                    .run_if(resource_equals(CurrentState(GameState::Playing))),
             )
-                .run_if(resource_equals(CurrentState(GameState::Playing))),
-        )
-        // Add 60hz physics update cycle
-        .insert_resource(FixedTime::new_from_secs(1.0 / 60.0))
-        .add_systems(
-            FixedUpdate,
-            // Only run these if the game is playing
-            (
-                apply_velocity,
-                move_paddle,
-                check_brick_collisions.after(apply_velocity),
-                walls::check_bottom_wall_collision.after(apply_velocity),
-                check_other_collisions.after(apply_velocity),
-            )
-                .run_if(resource_equals(CurrentState(GameState::Playing))),
-        );
+            // Add 60hz physics update cycle
+            .insert_resource(FixedTime::new_from_secs(FIXED_TIME_TICKS_PER_SECOND))
+            .add_systems(
+                FixedUpdate,
+                // Only run these if the game is playing
+                (
+                    // apply_velocity,
+                    move_ball,
+                    update_paddle_momentum.before(update_paddle),
+                    update_paddle,
+                    check_brick_collisions.after(apply_velocity),
+                    walls::check_bottom_wall_collision.after(apply_velocity),
+                    check_paddle_collision.after(apply_velocity),
+                    check_wall_collision.after(apply_velocity),
+                )
+                    .run_if(resource_equals(CurrentState(GameState::Playing))),
+            );
+    }
 }
 
 fn transition_game(
@@ -170,6 +201,7 @@ fn transition_game(
     mut paddle_q: Query<&mut Transform, (With<Paddle>, Without<Ball>)>,
     mut level: ResMut<Level>,
     mut brick_tracker: ResMut<BrickTracker>,
+    asset_server: Res<AssetServer>,
 ) {
     for transition in game_transition_reqs.iter() {
         info!(
@@ -190,7 +222,7 @@ fn transition_game(
                 // TODO: Detect win, display different UI
                 **level += 1; // Advance the level
                               // Spawn the next level's bricks and update te brick tracker
-                **brick_tracker = spawn_bricks(&mut commands, **level);
+                **brick_tracker = spawn_bricks(&mut commands, **level, &asset_server);
 
                 // Reset the ball and paddle positions
                 let mut ball = ball_q.iter_mut().next().unwrap();
@@ -223,8 +255,8 @@ fn manage_game(
 ) {
     match **game_state {
         GameState::Uninitialized => {
-            setup(&mut commands, &mut meshes, &mut mats, asset_server);
-            **brick_tracker = spawn_bricks(&mut commands, **level);
+            setup(&mut commands, &mut meshes, &mut mats, &asset_server);
+            **brick_tracker = spawn_bricks(&mut commands, **level, &asset_server);
             game_state_msgs.send(GameStateTransition::ToPlayGame);
         }
         GameState::Playing => {
@@ -243,7 +275,7 @@ fn setup(
     commands: &mut Commands,
     meshes: &mut ResMut<Assets<Mesh>>,
     mats: &mut ResMut<Assets<ColorMaterial>>,
-    asset_server: Res<AssetServer>,
+    asset_server: &Res<AssetServer>,
 ) {
     info!("Start breaker setup");
     // Create a default camera + all of its systems
@@ -281,7 +313,7 @@ fn setup(
         },
         Ball,
         // Ball doesn't get a collider, collisions are detected manually but with other colliders
-        Velocity(INITIAL_BALL_DIRECTION.normalize() * BALL_SPEED),
+        Velocity(INITIAL_BALL_DIRECTION.normalize()),
         Name::new("Ball"),
     ));
 
@@ -307,44 +339,68 @@ fn setup(
     walls::setup(commands);
 }
 
-// Handle paddle movement via A/D or Left/Right arrows, keeping the paddle within the play area
-// via these bounds
-const PADDLE_LEFT_BOUND: f32 =
-    walls::LEFT_WALL + walls::WALL_THICKNESS / 2.0 + PADDLE_SIZE.x / 2.0 + PADDLE_PADDING;
-const PADDLE_RIGHT_BOUND: f32 =
-    walls::RIGHT_WALL - walls::WALL_THICKNESS / 2.0 - PADDLE_SIZE.x / 2.0 - PADDLE_PADDING;
-fn move_paddle(
+// Updates the paddle's momentum param based on user input. Applies a force to the left with A/<- and to the right with D/<-
+fn update_paddle_momentum(
+    mut paddle_momentum: ResMut<PaddleMomentum>,
     keyboard_input: Res<Input<KeyCode>>,
-    mut paddle_q: Query<&mut Transform, With<Paddle>>,
     time_step: Res<FixedTime>,
 ) {
-    let mut paddle_tform = paddle_q.single_mut();
-    let mut dir = 0.0;
-
     let left = keyboard_input.pressed(KeyCode::A) || keyboard_input.pressed(KeyCode::Left);
     let right = keyboard_input.pressed(KeyCode::D) || keyboard_input.pressed(KeyCode::Right);
 
-    if left {
-        dir -= 1.0;
-    }
-    if right {
-        dir += 1.0;
-    }
+    let dir = match (left, right) {
+        (true, false) => -1.,
+        (false, true) => 1.,
+        _ => 0.,
+    };
 
-    let new_pos = paddle_tform.translation.x + dir * PADDLE_SPEED * time_step.period.as_secs_f32();
-
-    paddle_tform.translation.x = new_pos.clamp(PADDLE_LEFT_BOUND, PADDLE_RIGHT_BOUND)
+    // Change the momentum towards the movement direction, scaled by speed and time
+    // PADDLE_LERP basically gives the paddle high mass close to 0 and low mass close to 1
+    **paddle_momentum = paddle_momentum
+        .lerp(
+            dir * PADDLE_SPEED * time_step.period.as_secs_f32(),
+            PADDLE_LERP,
+        )
+        .clamp(-PADDLE_MAX_MOMENTUM, PADDLE_MAX_MOMENTUM);
 }
 
-fn apply_velocity(mut tform_vel_q: Query<(&mut Transform, &Velocity)>, time_step: Res<FixedTime>) {
+// Moves the paddle based on the current momentum value
+fn update_paddle(
+    mut paddle_q: Query<&mut Transform, With<Paddle>>,
+    paddle_momentum: Res<PaddleMomentum>,
+) {
+    let mut paddle_tform = paddle_q.single_mut();
+    let start = paddle_tform.translation.x;
+    let x = start + **paddle_momentum;
+    let x = x.clamp(PADDLE_LEFT_BOUND, PADDLE_RIGHT_BOUND);
+
+    let delta = x - start; // Calculate delta off actual movement since paddle is bounded by walls
+    paddle_tform.translation.x = x;
+}
+
+fn apply_velocity(
+    mut tform_vel_q: Query<(&mut Transform, &Velocity), Without<Ball>>,
+    time_step: Res<FixedTime>,
+) {
     for (mut tform, velocity) in &mut tform_vel_q {
         tform.translation.x += velocity.x * time_step.period.as_secs_f32();
         tform.translation.y += velocity.y * time_step.period.as_secs_f32();
     }
 }
 
+// The ball moves differently from other objects with velocity, since we do more manual
+// control of where it goes. It has a given velocity which is treated as a unit vector
+// and is scaled by the speed and duration of this physics tick
+fn move_ball(
+    mut ball_tform_vel: Query<(&mut Transform, &Velocity), With<Ball>>,
+    time_step: Res<FixedTime>,
+) {
+    let (mut ball_t, ball_v) = ball_tform_vel.single_mut();
+    let movement: Vec2 = ball_v.0 * time_step.period.as_secs_f32() * BALL_SPEED;
+    ball_t.translation += movement.extend(0.);
+}
+
 // Checks for collsions with bricks
-// TODO: Bug here with modifying the wrong brick sprite during a collision
 fn check_brick_collisions(
     mut commands: Commands,
     mut scoreboard: ResMut<Scoreboard>,
@@ -378,9 +434,95 @@ fn check_brick_collisions(
     }
 }
 
-fn check_other_collisions(
+fn check_paddle_collision(
     mut ball_q: Query<(&mut Velocity, &Transform), With<Ball>>,
-    mut collider_q: Query<&Transform, (With<Collider>, Without<Brick>, Without<walls::BottomWall>)>,
+    mut collider_q: Query<
+        &Transform,
+        (
+            With<Collider>,
+            With<Paddle>,
+            Without<Brick>,
+            Without<walls::BottomWall>,
+        ),
+    >,
+    mut collision_events: EventWriter<CollisionEvent>,
+    paddle_momentum: Res<PaddleMomentum>,
+    control_style: Res<ControlStyle>,
+) {
+    let (mut ball_v, ball_t) = ball_q.single_mut();
+    let ball_size = ball_t.scale.truncate();
+
+    for tform in collider_q.iter_mut() {
+        let collision = collide(
+            ball_t.translation,
+            ball_size,
+            tform.translation,
+            tform.scale.truncate(),
+        );
+        if let Some(collision) = collision {
+            collision_events.send_default();
+            // ball_ricochet mutates ball_v to be the already reflected vector
+            ball_ricochet(collision, &mut ball_v);
+            if let Collision::Bottom | Collision::Top = collision {
+                match control_style {
+                    ControlStyle::Edges => ball_influence_edges(collision, &mut ball_v, &tform),
+                    ControlStyle::Momentum => {
+                        ball_influence_momentum(collision, &mut ball_v, &paddle_momentum, &tform)
+                    }
+                    ControlStyle::Unaltered => {}
+                }
+            }
+            break; // Do not collide with multiple paddles in the same frame
+        }
+    }
+}
+
+// Changes ball_v based on the location of the ball's collision with the paddle
+// NOT A SYSTEM
+fn ball_influence_edges(collision: Collision, ball_vel: &Velocity, paddle_t: Transform) {
+    let reflected_angle = ball_v.angle_between(Vec2::Y);
+
+    // TODO: Calculate the influence of the paddle on the ball's reflection angle, then factor in to desired_angle below
+    let paddle_influence = PADDLE_MAX_INFLUENCE * (**paddle_momentum / PADDLE_MAX_MOMENTUM);
+
+    // Otherwise, adjust the movement by the offset * influence
+    let desired_angle = (reflected_angle + paddle_influence).clamp(-PI / 2., PI / 2.);
+    let magnitude = ball_v.0.length(); // Preserve momentum by tracking magnitude
+    ball_v.0 = Vec2::new(desired_angle.sin(), reflected_angle.cos()).normalize() * magnitude;
+}
+
+// Changes ball_v based on the momentum of the paddle at the time of collision
+// NOT A SYSTEM
+fn ball_influence_momentum(
+    collision: Collision,
+    ball_v: &Velocity,
+    paddle_momentum: &PaddleMomentum,
+    tform: Transform,
+) {
+    let reflected_angle = ball_v.angle_between(Vec2::Y);
+    // Convert the current momentum into a [-1, 1] range by dividing by PADDLE_MAX_SPEED, and scale by max influence to get the desired influence
+    let momentum_influence = PADDLE_MAX_INFLUENCE * (**paddle_momentum / PADDLE_MAX_MOMENTUM);
+
+    // Otherwise, adjust the movement by the offset * influence
+    let desired_angle = (reflected_angle + momentum_influence).clamp(-PI / 2., PI / 2.);
+    let magnitude = ball_v.0.length(); // Preserve momentum by tracking magnitude
+    ball_v.0 = Vec2::new(desired_angle.sin(), reflected_angle.cos()).normalize() * magnitude;
+}
+
+// fn ball_influence_edges()
+
+fn check_wall_collision(
+    mut ball_q: Query<(&mut Velocity, &Transform), With<Ball>>,
+    mut collider_q: Query<
+        &Transform,
+        (
+            With<Collider>,
+            With<Wall>,
+            Without<Paddle>,
+            Without<Brick>,
+            Without<walls::BottomWall>,
+        ),
+    >,
     mut collision_events: EventWriter<CollisionEvent>,
 ) {
     let (mut ball_v, ball_t) = ball_q.single_mut();
@@ -455,19 +597,26 @@ fn brick_collision(
     sprite.color = BRICK_COLORS[(**brick - 1) as usize];
 }
 
+const COLLISION_SOUND_DELAY: f32 = 0.1;
 // Plays a sound any time there is >= 1 CollisionEvent message
 // WARNING: Does not work in FixedUpdate (idk y) + Requires use of CollisionSound so must run only while Playing
 fn play_collision_sound(
+    mut delay: Local<f32>,
     mut commands: Commands,
     mut collision_events: EventReader<CollisionEvent>,
     sound: Res<CollisionSound>,
+    time: Res<Time>,
 ) {
+    *delay += time.delta_seconds();
     if !collision_events.is_empty() {
         collision_events.clear();
-        commands.spawn(AudioBundle {
-            source: sound.0.clone(),
-            settings: PlaybackSettings::DESPAWN,
-        });
+        if *delay >= COLLISION_SOUND_DELAY {
+            *delay = 0.;
+            commands.spawn(AudioBundle {
+                source: sound.0.clone(),
+                settings: PlaybackSettings::DESPAWN,
+            });
+        }
     }
 }
 
